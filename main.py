@@ -11,55 +11,100 @@ import numpy as np
 import copy
 import time
 import os
+import re
 # For results
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import classification_report
 # COCO
 from pycocotools.coco import COCO
 
+from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE
+
 device = torch.device('cuda')
 
 ROOT = './data'
 COCO_DATA = 'val2017'
 ANN = f'{ROOT}/annotatins/instances_{COCO_DATA}.json'
-DS_TYPE = False
+# DS_TYPE = False
 
-if DS_TYPE:
-    if not (os.path.exists(ROOT) and os.path.exists(ANN)):
-        print(f'COCO-{COCO_DATA} dataset not found')
-        exit(2)
+# if DS_TYPE:
+#     if not (os.path.exists(ROOT) and os.path.exists(ANN)):
+#         print(f'COCO-{COCO_DATA} dataset not found')
+#         exit(2)
 
-    train_data = torchvision.datasets.CocoDetection(
-        root=ROOT,
-        annFile=ANN
-        # transform=train_transform
-    )
-else:
-    train_data = torchvision.datasets.CIFAR10(
-        root=ROOT,
-        train=True,
-        download=True
-    )
-    test_data = torchvision.datasets.CIFAR10(
+#     train_data = torchvision.datasets.CocoDetection(
+#         root=ROOT,
+#         annFile=ANN
+#         # transform=train_transform
+#     )
+# else:
+train_data = torchvision.datasets.CIFAR10(
+    root=ROOT,
+    train=True,
+    download=True
+)
+
+train_mean = train_data.data.mean(axis=(0,1,2)) / 255
+train_std = train_data.data.mean(axis=(0,1,2)) / 255
+    
+train_transforms = torchvision.transforms.Compose([
+                                                    torchvision.transforms.ToTensor(),
+                                                    torchvision.transforms.Normalize(train_mean, train_std)
+])
+test_transforms = torchvision.transforms.Compose([
+                                                    torchvision.transforms.ToTensor(),
+                                                    torchvision.transforms.Normalize(train_mean, train_std)
+])
+
+train_data = torchvision.datasets.CIFAR10(
         root=ROOT,
         train=False,
-        download=True
-    )
+        download=True,
+        transform=train_transforms
+)
+test_data = torchvision.datasets.CIFAR10(
+        root=ROOT,
+        train=False,
+        download=True,
+        transform=test_transforms
+)
 
 print(train_data)
 print(train_data.data.shape)
 print(test_data)
 print(test_data.data.shape)
 
-def rename_attribute(obj, old_name, new_name):
-    obj._modules[new_name] = obj._modules.pop(old_name)
-import re
+num_train_examples = int(len(train_data) * 0.8)
+num_valid_examples = len(train_data) - num_train_examples
+print(num_train_examples, num_valid_examples)
+
+train_data, valid_data = data.random_split(train_data, [num_train_examples, num_valid_examples])
+valid_data = copy.deepcopy(valid_data) # changing train transformations won't affect the validation set
+valid_data.dataset.transform = test_transforms
+
+train_iterator = data.DataLoader(train_data,
+                                             shuffle=True,
+                                             batch_size=BATCH_SIZE
+)
+valid_iterator = data.DataLoader(valid_data,
+                                             shuffle=True,
+                                             batch_size=BATCH_SIZE
+)
+test_iterator = data.DataLoader(test_data,
+                                             shuffle=True,
+                                             batch_size=BATCH_SIZE
+)
 
 resnet = torchvision.models.resnet
 
 resnet50 = resnet.resnet50(weights='DEFAULT')
 # print(resnet50)
-resnet50 = resnet50.cuda()
+resnet50 = resnet50.to(device)
+# resnet101 = resnet.resnet101(weights='DEFAULT')
+# resnet101 = resnet101.to(device)
+#? layer_i is the same as conv_i+1 in the paper
+
+#? register_forward_hook maybe for adding the new outputs
 
 class RPN(nn.Module):
     def __init__(self, backbone: nn.Module, d=256) -> None:
@@ -73,7 +118,7 @@ class RPN(nn.Module):
         self.p4 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3)
         self.p5 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3)
     
-    def _lateral(self, C_i, P_i_plus_1, sum_components=True): #* merge operation of C_i with upsampled P_i-1
+    def _lateral(self, C_i, P_i_plus_1=nn.Identity(), sum_components=True): #* merge operation of C_i with upsampled P_i-1
         reduced_channels_C = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=1)(C_i)
         if sum_components:
             upscaled_P = nn.Upsample(scale_factor=2, mode='nearest')(P_i_plus_1)
@@ -91,7 +136,7 @@ class RPN(nn.Module):
             if not name.find('layer'):
                 pass
             print(f'Copying layer {name}')
-            layers[name] =  {"level": int(re.search(name).group()), "module": subm}
+            layers[name] =  {"level": int(re.search(name, "\d").group()), "module": subm}
             if layers[name].level > last:
                 last = layers[name].level
         for name in sorted(layers.keys(), reverse=True):
@@ -100,5 +145,27 @@ class RPN(nn.Module):
             if l == last:
                 self._lateral(m, sum_components=False)
             else:
-                self._lateral(m, self[f'p{l+1}'])
+                self._lateral(m, getattr(self, f'p{l+1}'))
 
+model = RPN(resnet50)
+# print(model)
+print(f"The model has {count_parameters(model):,} trainable parameters")
+
+#! wrong criterion for object classification
+criterion = nn.CrossEntropyLoss() # softmax + crossentropy
+criterion = criterion.to(device)
+
+optimizer = optim.SGD(model.parameters(), lr=3e-3) # could be anything, like adam
+model = model.to(device)
+
+N_EPOCHS = 25
+train_losses, train_accs, valid_losses, valid_accs = model_training(N_EPOCHS, 
+                                                                    model, 
+                                                                    train_iterator, 
+                                                                    valid_iterator, 
+                                                                    optimizer, 
+                                                                    criterion, 
+                                                                    device,
+                                                                    'rpm.pt')
+
+plot_results(N_EPOCHS, train_losses, train_accs, valid_losses, valid_accs)
