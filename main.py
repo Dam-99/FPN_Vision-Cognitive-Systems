@@ -106,17 +106,23 @@ train_data = wrap_dataset_for_transforms_v2(train_data)
 valid_data = wrap_dataset_for_transforms_v2(valid_data)
 test_data = wrap_dataset_for_transforms_v2(test_data)
 
+def collate_fn(batch): # TODO: could be better for less bloated code in training and model
+    return tuple(zip(*batch))
+
 train_iterator = data.DataLoader(train_data,
                                              shuffle=True,
-                                             batch_size=BATCH_SIZE
+                                             collate_fn=collate_fn,
+                                             batch_size=BATCH_SIZE,
 )
 valid_iterator = data.DataLoader(valid_data,
                                              shuffle=True,
-                                             batch_size=BATCH_SIZE
+                                             collate_fn=collate_fn,
+                                             batch_size=BATCH_SIZE,
 )
 test_iterator = data.DataLoader(test_data,
                                              shuffle=True,
-                                             batch_size=BATCH_SIZE
+                                             collate_fn=collate_fn,
+                                             batch_size=BATCH_SIZE,
 )
 
 resnet = torchvision.models.resnet
@@ -150,7 +156,7 @@ class RPN(nn.Module):
         else:
             return reduced_channels_C
     
-    def forward(self, x):
+    def _batch_element_forward(self, x):
         batch_size = x[0]
         print(type(x))
         x = self.backbone.forward(x)
@@ -170,6 +176,16 @@ class RPN(nn.Module):
                 self._lateral(m, sum_components=False)
             else:
                 self._lateral(m, getattr(self, f'p{l+1}'))
+                
+        return x
+    
+    def forward(self, x):
+        if isinstance(x, torch.Tensor):
+            x = self._batch_element_forward(x)
+        else:
+            for x_i in x:
+                x_i = self._batch_element_forward(x_i)
+        return x
 
 model = RPN(resnet50)
 # print(model)

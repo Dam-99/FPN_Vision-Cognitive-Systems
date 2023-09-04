@@ -41,8 +41,22 @@ def train(model, iterator, optimizer, criterion, device):
   model.train()
 
   for (x,y) in iterator:
-    x = x.to(device)
-    y = y.to(device)
+    # x = x.to(device)
+    for i, x_i in enumerate(x):
+      x_i = x_i.to(device)
+    
+    if type(y) != list and type(y) != tuple:
+      y = y.to(device)
+    elif type(y) == tuple:
+      for i, y_i in enumerate(y):
+        if 'boxes' in y_i.keys():
+          y[i]['boxes'] = y_i['boxes'].to(device)
+        if 'masks' in y_i.keys():
+          y[i]['masks'] = y_i['masks'].to(device)
+        if 'boxes' in y_i.keys():
+          y[i]['labels'] = y_i['labels'].to(device)
+    else:
+      y = [y_i.to(device) for y_i in y]
     
     # Set gradients to zero
     optimizer.zero_grad()
@@ -79,9 +93,22 @@ def evaluate(model, iterator, criterion, device):
   with torch.no_grad():
 
     for (x,y) in iterator:
-
-      x = x.to(device)
-      y = y.to(device)
+      # x = x.to(device)
+      for i, x_i in enumerate(x):
+        x_i = x_i.to(device)
+      
+      if type(y) != list and type(y) != tuple:
+        y = y.to(device)
+      elif type(y) == tuple:
+        for i, y_i in enumerate(y):
+          if 'boxes' in y_i.keys():
+            y[i]['boxes'] = y_i['boxes'].to(device)
+          if 'masks' in y_i.keys():
+            y[i]['masks'] = y_i['masks'].to(device)
+          if 'boxes' in y_i.keys():
+            y[i]['labels'] = y_i['labels'].to(device)
+      else:
+        y = [y_i.to(device) for y_i in y]
       
       # Make Predictions
       y_pred = model(x)
@@ -149,13 +176,13 @@ def plot_results(n_epochs, train_losses, train_accs, valid_losses, valid_accs):
   plt.plot(np.arange(N_EPOCHS)+1, train_losses, linewidth=3)
   plt.plot(np.arange(N_EPOCHS)+1, valid_losses, linewidth=3)
   _ = plt.legend(['Train', 'Validation'])
-  plt.grid('on'), plt.xlabel('Epoch'), plt.ylabel('Loss')
+  _ = plt.grid(True), plt.xlabel('Epoch'), plt.ylabel('Loss')
 
   _ = plt.subplot(1,2,2)
   plt.plot(np.arange(N_EPOCHS)+1, train_accs, linewidth=3)
   plt.plot(np.arange(N_EPOCHS)+1, valid_accs, linewidth=3)
   _ = plt.legend(['Train', 'Validation'])
-  plt.grid('on'), plt.xlabel('Epoch'), plt.ylabel('Accuracy')
+  _ = plt.grid(True), plt.xlabel('Epoch'), plt.ylabel('Accuracy')
 
 def count_parameters(model):
   return sum(p.numel() for p in model.parameters() if p.requires_grad) # Count only parameters that are backpropagated
