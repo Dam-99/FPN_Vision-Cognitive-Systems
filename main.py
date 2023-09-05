@@ -137,46 +137,64 @@ resnet50 = resnet50.to(device)
 #? register_forward_hook maybe for adding the new outputs
 
 class RPN(nn.Module):
-    def __init__(self, backbone: nn.Module, d=256) -> None:
+    def __init__(self, backbone: nn.Module, d=256, batch_size=BATCH_SIZE) -> None:
         super().__init__()
         self.backbone = copy.deepcopy(backbone)
         self._d = d
+        self.batch_size = batch_size
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
-        self.p2 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3) #* these are the 3x3 maps added after each merge
-        self.p3 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3)
-        self.p4 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3)
-        self.p5 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3)
+        self.p2 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False) #* these are the 3x3 maps added after each merge
+        self.p3 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
+        self.p4 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
+        self.p5 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
     
-    def _lateral(self, C_i, P_i_plus_1=nn.Identity(), sum_components=True): #* merge operation of C_i with upsampled P_i-1
-        reduced_channels_C = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=1)(C_i)
+    def _lateral(self, C_i, x_C, x_P, P_i_plus_1=nn.Identity(), sum_components=True): #* merge operation of C_i with upsampled P_i-1
+        x_C = C_i(x_C)
+        reduced_channels_C = nn.Conv2d(in_channels=x_C.shape[1], out_channels=self._d, kernel_size=1).to(device)
+        reduced_channels_C = reduced_channels_C(x_C)
         if sum_components:
-            upscaled_P = nn.Upsample(scale_factor=2, mode='nearest')(P_i_plus_1)
+            x_P = P_i_plus_1(x_P)
+            upscaled_P = nn.Upsample(scale_factor=2, mode='nearest').to(device)
+            upscaled_P = upscaled_P(x_P)
             return torch.add(upscaled_P, reduced_channels_C)
         else:
             return reduced_channels_C
     
-    def _batch_element_forward(self, x):
-        batch_size = x[0]
-        print(type(x))
-        x = self.backbone.forward(x)
+    def _batch_element_forward(self, x: torch.Tensor):
+        print(x.size())
+        in_layers = False
+        # x = self.backbone(x)
         layers = {}
         last = 0
-        for name, subm in self.backbone.named_children():
-            if not name.find('layer'):
-                pass
-            print(f'Copying layer {name}')
-            layers[name] =  {"level": int(re.search(name, "\d").group()), "module": subm}
-            if layers[name].level > last:
-                last = layers[name].level
+        for name, subm in self.backbone.named_children(): #* remove last classification layers from the backbone
+            if not in_layers or name.find('layer') != -1:
+                if name.find('layer') != -1: # started 'layer's
+                    in_layers = True
+                    #* save layers for lateral connections
+                    l = int(re.search("\d", name).group())
+                    p = [pi for n, pi in self.named_children() if n.find(f'p{l}')][0]
+                    layers[name] =  {"level": l, "module": subm, "p_module": p, "x": x}
+                    if layers[name]['level'] > last: # probs don't need this condition
+                        last = layers[name]['level']
+                x = subm(x)
+            else: # finished 'layer's
+                x = x
+        
         for name in sorted(layers.keys(), reverse=True):
-            l = layers[name].level
-            m = layers[name].module
-            if l == last:
-                self._lateral(m, sum_components=False)
+            l = layers[name]['level']
+            m = layers[name]['module']
+            p = layers[name]['p_module']
+            m_iminus1_x = layers[name]['x']
+            
+            # these calls use the x computed from the x at the previus iteration, aka the x after it's been processed by a higher level in the pyramid
+            if l == last: 
+                x = self._lateral(m, m_iminus1_x, x, sum_components=False)
             else:
-                self._lateral(m, getattr(self, f'p{l+1}'))
-                
+                x = self._lateral(m, m_iminus1_x, x, p)
+            m.train()
+            
+        print(x.size())
         return x
     
     def forward(self, x):
