@@ -136,7 +136,7 @@ resnet50 = resnet50.to(device)
 
 #? register_forward_hook maybe for adding the new outputs
 
-class RPN(nn.Module):
+class FPN(nn.Module):
     def __init__(self, backbone: nn.Module, d=256, batch_size=BATCH_SIZE) -> None:
         super().__init__()
         self.backbone = copy.deepcopy(backbone)
@@ -144,10 +144,10 @@ class RPN(nn.Module):
         self.batch_size = batch_size
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
-        self.p2 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False) #* these are the 3x3 maps added after each merge
-        self.p3 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
-        self.p4 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
-        self.p5 = nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
+        self.ps = nn.ModuleDict({ #* these are the 3x3 maps added after each merge
+            f'p{i+1}': nn.Conv2d(in_channels=self._d, out_channels=self._d, kernel_size=3, padding=1, bias=False)
+                for i in range(1, 5) #TODO: check how many layers the backbone has to make it more automatic
+            })
     
     def _lateral(self, C_i, x_C, x_P, P_i_plus_1=nn.Identity(), sum_components=True): #* merge operation of C_i with upsampled P_i-1
         x_C = C_i(x_C)
@@ -162,7 +162,6 @@ class RPN(nn.Module):
             return reduced_channels_C
     
     def _batch_element_forward(self, x: torch.Tensor):
-        print(x.size())
         in_layers = False
         # x = self.backbone(x)
         layers = {}
@@ -173,9 +172,9 @@ class RPN(nn.Module):
                     in_layers = True
                     #* save layers for lateral connections
                     l = int(re.search("\d", name).group())
-                    p = [pi for n, pi in self.named_children() if n.find(f'p{l}')][0]
+                    p = [pi for n, pi in self.ps.named_children()][0]
                     layers[name] =  {"level": l, "module": subm, "p_module": p, "x": x}
-                    if layers[name]['level'] > last: # probs don't need this condition
+                    if layers[name]['level'] > last: #? condition probably not needed
                         last = layers[name]['level']
                 x = subm(x)
             else: # finished 'layer's
@@ -194,7 +193,6 @@ class RPN(nn.Module):
                 x = self._lateral(m, m_iminus1_x, x, p)
             m.train()
             
-        print(x.size())
         return x
     
     def forward(self, x):
@@ -205,7 +203,42 @@ class RPN(nn.Module):
                 x_i = self._batch_element_forward(x_i)
         return x
 
-model = RPN(resnet50)
+default_backbone = resnet.resnet50(weights='DEFAULT')
+default_backbone.to(device)
+
+class RPN(nn.Module):
+    def __init__(self, n=3, backbone: nn.Module = default_backbone, d=256, batch_size=BATCH_SIZE) -> None:
+        super().__init__()
+        self.fpn = FPN(backbone, d, batch_size)
+        self.heads = nn.ModuleDict({
+            f'h_{name}': self._create_head(pi, n)
+                for name, pi in self.fpn.ps.items() #TODO: check how many layers the backbone has to make it more automatic
+            })
+        
+    def _create_head(self, p, n):# nn.Conv2d):
+        head = nn.Sequential(
+                nn.Conv2d(in_channels=p.out_channels, out_channels=1, kernel_size=n, bias=p.bias),
+                nn.ModuleDict({
+                    n: nn.Conv2d(in_channels=1, out_channels=1, kernel_size=1, bias=p.bias)
+                    for n in ['reg', 'cls']
+                })
+        )
+        return head
+    
+    def _batch_element_forward(self, x: torch.Tensor):
+        x = self.fpn(x)
+        x = self.heads(x)
+        return x
+    
+    def forward(self, x):
+        if isinstance(x, torch.Tensor):
+            x = self._batch_element_forward(x)
+        else:
+            for x_i in x:
+                x_i = self._batch_element_forward(x_i)
+        return x
+
+model = RPN(backbone=resnet50)
 # print(model)
 print(f"The model has {count_parameters(model):,} trainable parameters")
 
