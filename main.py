@@ -1,3 +1,4 @@
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +22,7 @@ from sklearn.metrics import classification_report
 # COCO
 from pycocotools.coco import COCO
 
-from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE
+from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE, cache_empty, find_free_anns_ids, repair_empty, BROKEN_PATH
 
 device = torch.device('cuda')
 
@@ -40,7 +41,7 @@ ANN_TEST = f'{ROOT}/annotations/image_info_{COCO_DATA_TEST}.json'
 BATCH_SIZE = 256
 MODELS_PATH = 'models/'
 
-if not (os.path.exists(ROOT) and os.path.exists(ANN)):
+if not (os.path.exists(ROOT) and os.path.exists(ANN_TRAIN)):
     print(f'COCO-{COCO_DATA} dataset not found')
     exit(2)
     
@@ -60,70 +61,126 @@ test_transforms = transforms_v2.Compose([
                                             # transforms_v2.SanitizeBoundingBox(),
 ])
 
-if DS_TYPE:
-        train_data = CocoDetection(
-                root=ROOT_TRAIN,
-                annFile=ANN_TRAIN,
-                transforms=train_transforms
-        )
-        valid_data = CocoDetection(
-                root=ROOT_VAL,
-                annFile=ANN_VAL,
-                transforms=test_transforms
-        )
-# TOFIX: this should be splitting the training dataset instead of taking the validation one two times, but typings later on don't work
-else:
-        train_data = CocoDetection(
-                root=ROOT_VAL,
-                annFile=ANN_VAL,
-                transforms=train_transforms
-        )
-        valid_data = CocoDetection(
-                root=ROOT_VAL,
-                annFile=ANN_VAL,
-                transforms=test_transforms
-        )
-    # num_train_examples = int(len(train_data) * 0.8)
-    # num_valid_examples = len(train_data) - num_train_examples
-    # print('Splitting val for training:', num_train_examples, num_valid_examples)
+def load_data():
+    if DS_TYPE:
+            train_data = CocoDetection(
+                    root=ROOT_TRAIN,
+                    annFile=ANN_TRAIN,
+                    transforms=train_transforms
+            )
+            val_data = CocoDetection(
+                    root=ROOT_VAL,
+                    annFile=ANN_VAL,
+                    transforms=test_transforms
+            )
+    # TOFIX: this should be splitting the training dataset instead of taking the validation one two times, but typings later on don't work
+    else:
+            train_data = CocoDetection(
+                    root=ROOT_VAL,
+                    annFile=ANN_VAL,
+                    transforms=train_transforms
+            )
+            val_data = CocoDetection(
+                    root=ROOT_VAL,
+                    annFile=ANN_VAL,
+                    transforms=test_transforms
+            )
+        # num_train_examples = int(len(train_data) * 0.8)
+        # num_valid_examples = len(train_data) - num_train_examples
+        # print('Splitting val for training:', num_train_examples, num_valid_examples)
 
-    # train_data, valid_data = data.random_split(train_data, [num_train_examples, num_valid_examples])
-    # valid_data = copy.deepcopy(valid_data) # changing train transformations won't affect the validation set
-    # valid_data.dataset.transform = test_transforms
+        # train_data, val_data = data.random_split(train_data, [num_train_examples, num_valid_examples])
+        # val_data = copy.deepcopy(val_data) # changing train transformations won't affect the validation set
+        # val_data.dataset.transform = test_transforms
 
-test_data = CocoDetection(
-        root=ROOT_TEST,
-        annFile=ANN_TEST,
-        transforms=test_transforms
-)
+    test_data = CocoDetection(
+            root=ROOT_TEST,
+            annFile=ANN_TEST,
+            transforms=test_transforms
+    )
+    
+    return train_data, val_data, test_data
+
+train_data, val_data, test_data = load_data()
 
 print('TRAIN:', train_data)
-print('VALID:', valid_data)
+print('VALID:', val_data)
 print('TEST:', test_data)
 
 # Wrapper for better handling of data in Object detection
 train_data = wrap_dataset_for_transforms_v2(train_data)
-valid_data = wrap_dataset_for_transforms_v2(valid_data)
+val_data = wrap_dataset_for_transforms_v2(val_data)
 test_data = wrap_dataset_for_transforms_v2(test_data)
 
 def collate_fn(batch): # TODO: could be better for less bloated code in training and model
     return tuple(zip(*batch))
 
-train_iterator = data.DataLoader(train_data,
-                                             shuffle=True,
-                                             collate_fn=collate_fn,
-                                             batch_size=BATCH_SIZE,
-)
-valid_iterator = data.DataLoader(valid_data,
-                                             shuffle=True,
-                                             collate_fn=collate_fn,
-                                             batch_size=BATCH_SIZE,
-)
-test_iterator = data.DataLoader(test_data,
-                                             shuffle=True,
-                                             collate_fn=collate_fn,
-                                             batch_size=BATCH_SIZE,
-)
+def create_iterators(train_data=train_data, val_data=val_data, test_data=test_data):
+    train_iterator = data.DataLoader(train_data,
+                                    # shuffle=True,
+                                    collate_fn=collate_fn,
+                                    batch_size=BATCH_SIZE,
+                                    # num_workers=1
+    )
+    val_iterator = data.DataLoader(val_data,
+                                    # shuffle=True,
+                                    collate_fn=collate_fn,
+                                    batch_size=BATCH_SIZE,
+                                    # num_workers=1
+    )
+    test_iterator = data.DataLoader(test_data,
+                                    # shuffle=True,
+                                    collate_fn=collate_fn,
+                                    batch_size=BATCH_SIZE,
+                                    # num_workers=1
+    )
+    return train_iterator, val_iterator, test_iterator
+
+train_iterator, val_iterator, test_iterator = create_iterators()
+     
+def check_empty_targets(iterator, dataset, use_cache, ds_name, ann_ids):
+  try:
+    # iterator will try to create batches before the loop starts, so the error will be raised right away
+    for x,y in iterator:
+        break
+  except:
+    repair_empty(dataset, ds_name, use_cache, ann_ids)
+    global train_data, val_data, test_data
+    train_data, val_data, test_data = load_data()
+    global train_iterator, val_iterator, test_iterator
+    train_iterator, val_iterator, test_iterator = create_iterators()
+
+missing_train_ann_ids = []
+train_anns_sorted = sorted(train_data.coco.getAnnIds())
+with open(F'{BROKEN_PATH}train.json', 'r') as f:
+    train_missing = len(json.load(f))
+find_free_anns_ids(train_anns_sorted, missing_train_ann_ids, train_missing)
+
+missing_val_ann_ids = []
+val_anns_sorted = sorted(val_data.coco.getAnnIds())
+with open(f'{BROKEN_PATH}val.json', 'r') as f:
+    val_missing = len(json.load(f))
+find_free_anns_ids(val_anns_sorted, missing_val_ann_ids, val_missing)
+
+cache = False
+use_cache = True
+check = True
+
+#! These functions won't work if the "SanitizeBoundingBoxes" transforms is active, and other transforms may ruin the result
+if cache:
+    print('Checking Train Dataset...')
+    cache_empty(train_data, 'train')
+    print('Checking Valid Dataset...')
+    cache_empty(val_data, 'val')
+    print('Checking Test Dataset...')
+
+if check:
+    print('Checking Train Dataset...')
+    check_empty_targets(train_iterator, train_data, use_cache, 'train', missing_train_ann_ids)
+    print('Checking Valid Dataset...')
+    check_empty_targets(val_iterator, val_data, use_cache, 'val', missing_val_ann_ids)
+    print('Done')
+
 
 resnet = torchvision.models.resnet
 
@@ -253,7 +310,7 @@ N_EPOCHS = 25
 train_losses, train_accs, valid_losses, valid_accs = model_training(N_EPOCHS, 
                                                                     model, 
                                                                     train_iterator, 
-                                                                    valid_iterator, 
+                                                                    val_iterator, 
                                                                     optimizer, 
                                                                     criterion, 
                                                                     device,

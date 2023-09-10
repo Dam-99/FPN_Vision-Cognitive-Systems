@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+import json
 
 MODELS_PATH = 'models/'
 BATCH_SIZE = 256
@@ -186,3 +187,71 @@ def plot_results(n_epochs, train_losses, train_accs, valid_losses, valid_accs):
 
 def count_parameters(model):
   return sum(p.numel() for p in model.parameters() if p.requires_grad) # Count only parameters that are backpropagated
+
+UP = '\033[1A'
+CLEAR = '\x1b[2K'
+BROKEN_PATH = 'broken/'
+
+def cache_empty(dataset, ds_name):
+    broken = []
+    print('Progress:\n')
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        img, target = sample
+        if(i%500 == 0):
+            print(UP,end=CLEAR)
+            print(f'\r{i+1}/{len(dataset)}')
+        if not ('labels' in target.keys() and 'segmentation' in target.keys()):
+            broken.append({'idx': i, 'img_id': target['image_id'], 'keys': target.keys()})
+            print(UP,end=CLEAR)
+            print(f'\r{i}: {target["image_id"]}, {target.keys()}\n')
+    with open(f'{BROKEN_PATH}{ds_name}.json', 'w') as f:
+        json.dump([i['idx'] for i in broken], f)
+    with open(f'{BROKEN_PATH}{ds_name}.json', 'w') as f:
+        json.dump([i['img_id'] for i in broken], f)
+
+def repair_empty(dataset, ds_name, use_cache, ann_ids):
+    print(f'Repairing {ds_name}:')
+    with open(f'data/annotations/instances_{ds_name}2017.json', 'r') as annsFile:
+        contents = json.load(annsFile)
+    anns = contents['annotations']
+    if use_cache:
+        with open(f'{BROKEN_PATH}{ds_name}.json', 'r') as f:
+            checklist = json.load(f)
+    else:
+        checklist = range(len(dataset))
+    print('Progress:\n')
+    for i in checklist:
+      sample = dataset[i]
+      img, target = sample
+      img_id = target['image_id']
+      if(i%(5 if not use_cache and ds_name == 'val' else 500) == 0):
+        print(UP,end=CLEAR)
+        print(f'\r{i+1}/{len(dataset)}')
+      if use_cache or not ('labels' in target.keys() and 'segmentation' in target.keys()):
+        c, h, w = img.size()
+        bbox =  [0, 0, w, h]
+        seg = [0, 0, 0, h, w, h, w, 0]
+        seg = [[float(n) for n in seg]]
+        area = float(w*h)
+        target = {'segmentation': seg, 'area': area, 'iscrowd': 0, 'image_id': img_id, 'bbox': bbox, 'category_id': 0, 'id': ann_ids.pop(0)} #! cat 0 is background, could be a problem
+        anns.append(target)
+        # print(i, target['image_id'])
+    contents['annotations'] = anns
+    with open(f'data/annotations/instances_{ds_name}2017.json', 'w') as annsFile:
+      json.dump(contents, annsFile)
+        
+def find_free_anns_ids(anns_sorted, free_ann_ids, missing):
+    last = 1
+    finished = False
+    for ann_id in anns_sorted:
+      if ann_id != last+1 and not finished:
+        for i in range(last, ann_id):
+          if not finished:
+            free_ann_ids.append(i)
+            if len(free_ann_ids) >= missing:
+              finished = True
+              break
+      elif finished:
+        break
+      last = ann_id
