@@ -45,19 +45,20 @@ if not (os.path.exists(ROOT) and os.path.exists(ANN_TRAIN)):
     print(f'COCO-{COCO_DATA} dataset not found')
     exit(2)
     
-# def labels_getter(inputs):
-#         return inputs[1]['labels']
-    
+def labels_getter(inputs):
+        return inputs[1]['labels']
+
+#? see FPN's _lateral method for disclaimer
 train_transforms = transforms_v2.Compose([
                                             transforms_v2.ToImageTensor(),
-                                            # transforms_v2.Resize((420, 640), antialias=True),
-                                            # transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
+                                            transforms_v2.Resize((640, 640), antialias=True),
+                                            transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
                                             # transforms_v2.SanitizeBoundingBox(),
 ])
 test_transforms = transforms_v2.Compose([
                                             transforms_v2.ToImageTensor(),
-                                            # transforms_v2.Resize((420, 640), antialias=True),
-                                            # transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
+                                            transforms_v2.Resize((640, 640), antialias=True),
+                                            transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
                                             # transforms_v2.SanitizeBoundingBox(),
 ])
 
@@ -98,6 +99,11 @@ def load_data():
             annFile=ANN_TEST,
             transforms=test_transforms
     )
+        
+    # Wrapper for better handling of data in Object detection
+    train_data = wrap_dataset_for_transforms_v2(train_data)
+    val_data = wrap_dataset_for_transforms_v2(val_data)
+    test_data = wrap_dataset_for_transforms_v2(test_data)
     
     return train_data, val_data, test_data
 
@@ -107,29 +113,25 @@ print('TRAIN:', train_data)
 print('VALID:', val_data)
 print('TEST:', test_data)
 
-# Wrapper for better handling of data in Object detection
-train_data = wrap_dataset_for_transforms_v2(train_data)
-val_data = wrap_dataset_for_transforms_v2(val_data)
-test_data = wrap_dataset_for_transforms_v2(test_data)
-
-def collate_fn(batch): # TODO: could be better for less bloated code in training and model
+#? needed even if images have the same size because of the targets being different
+def collate_fn(batch): # TODO: could be improved for less bloated code in training and model
     return tuple(zip(*batch))
 
 def create_iterators(train_data=train_data, val_data=val_data, test_data=test_data):
     train_iterator = data.DataLoader(train_data,
-                                    # shuffle=True,
+                                    shuffle=True,
                                     collate_fn=collate_fn,
                                     batch_size=BATCH_SIZE,
                                     # num_workers=1
     )
     val_iterator = data.DataLoader(val_data,
-                                    # shuffle=True,
+                                    shuffle=True,
                                     collate_fn=collate_fn,
                                     batch_size=BATCH_SIZE,
                                     # num_workers=1
     )
     test_iterator = data.DataLoader(test_data,
-                                    # shuffle=True,
+                                    shuffle=True,
                                     collate_fn=collate_fn,
                                     batch_size=BATCH_SIZE,
                                     # num_workers=1
