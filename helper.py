@@ -8,6 +8,7 @@ import json
 MODELS_PATH = 'models/'
 BATCH_SIZE = 256
 
+# TODO: check if it's correct for this project
 def calculate_accuracy(y_pred, y):
   '''
   Compute accuracy from ground-truth and predicted labels.
@@ -43,19 +44,18 @@ def train(model, iterator, optimizer, criterion, device):
 
   for (x,y) in iterator:
     # x = x.to(device)
+    x = list(x)
     for i, x_i in enumerate(x):
-      x_i = x_i.to(device)
+      x[i] = x_i.to(device).float()
+    x = tuple(x)
     
     if type(y) != list and type(y) != tuple:
       y = y.to(device)
     elif type(y) == tuple:
       for i, y_i in enumerate(y):
-        if 'boxes' in y_i.keys():
-          y[i]['boxes'] = y_i['boxes'].to(device)
-        if 'masks' in y_i.keys():
-          y[i]['masks'] = y_i['masks'].to(device)
-        if 'boxes' in y_i.keys():
-          y[i]['labels'] = y_i['labels'].to(device)
+        for k in y_i.keys():
+          if isinstance(y_i[k], torch.Tensor): # boxes, masks, labels
+            y[i][k] = y_i[k].to(device)
     else:
       y = [y_i.to(device) for y_i in y]
     
@@ -95,19 +95,18 @@ def evaluate(model, iterator, criterion, device):
 
     for (x,y) in iterator:
       # x = x.to(device)
+      x = list(x)
       for i, x_i in enumerate(x):
-        x_i = x_i.to(device)
+        x[i] = x_i.to(device).float()
+      x = tuple(x)
       
       if type(y) != list and type(y) != tuple:
         y = y.to(device)
       elif type(y) == tuple:
         for i, y_i in enumerate(y):
-          if 'boxes' in y_i.keys():
-            y[i]['boxes'] = y_i['boxes'].to(device)
-          if 'masks' in y_i.keys():
-            y[i]['masks'] = y_i['masks'].to(device)
-          if 'boxes' in y_i.keys():
-            y[i]['labels'] = y_i['labels'].to(device)
+          for k in y_i.keys():
+            if isinstance(y_i[k], torch.Tensor): # boxes, masks, labels
+              y[i][k] = y_i[k].to(device)
       else:
         y = [y_i.to(device) for y_i in y]
       

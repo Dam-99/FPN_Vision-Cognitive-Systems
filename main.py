@@ -210,7 +210,7 @@ class FPN(nn.Module):
     
     def _lateral(self, C_i, x_C, x_P, P_i_plus_1=nn.Identity(), sum_components=True): #* merge operation of C_i with upsampled P_i-1
         x_C = C_i(x_C)
-        reduced_channels_C = nn.Conv2d(in_channels=x_C.shape[1], out_channels=self._d, kernel_size=1).to(device)
+        reduced_channels_C = nn.Conv2d(in_channels=x_C.shape[1], out_channels=self._d, kernel_size=1).to(device) #? if the image's size is divided enough times to get to a odd dimension, reduced_channels_C and upscaled_P may have different dimensions
         reduced_channels_C = reduced_channels_C(x_C)
         if sum_components:
             x_P = P_i_plus_1(x_P)
@@ -231,7 +231,7 @@ class FPN(nn.Module):
                     in_layers = True
                     #* save layers for lateral connections
                     l = int(re.search("\d", name).group())
-                    p = [pi for n, pi in self.ps.named_children()][0]
+                    p = [pi for n, pi in self.ps.named_children()][l-1]
                     layers[name] =  {"level": l, "module": subm, "p_module": p, "x": x}
                     if layers[name]['level'] > last: #? condition probably not needed
                         last = layers[name]['level']
@@ -250,7 +250,6 @@ class FPN(nn.Module):
                 x = self._lateral(m, m_iminus1_x, x, sum_components=False)
             else:
                 x = self._lateral(m, m_iminus1_x, x, p)
-            m.train()
             
         return x
     
@@ -258,51 +257,97 @@ class FPN(nn.Module):
         if isinstance(x, torch.Tensor):
             x = self._batch_element_forward(x)
         else:
+            new_x = []
             for x_i in x:
                 x_i = self._batch_element_forward(x_i)
+                new_x.append(x_i)
+            x = tuple(new_x)
         return x
 
 default_backbone = resnet.resnet50(weights='DEFAULT')
 default_backbone.to(device)
 
 class RPN(nn.Module):
-    def __init__(self, n=3, backbone: nn.Module = default_backbone, d=256, batch_size=BATCH_SIZE) -> None:
+    def __init__(self, backbone: nn.Module = default_backbone, k=3, n=3, d=256, batch_size=BATCH_SIZE) -> None:
         super().__init__()
         self.fpn = FPN(backbone, d, batch_size)
         self.heads = nn.ModuleDict({
-            f'h_{name}': self._create_head(pi, n)
+            f'h_{name}': self._create_head(pi, k, n)
                 for name, pi in self.fpn.ps.items() #TODO: check how many layers the backbone has to make it more automatic
             })
         
-    def _create_head(self, p, n):# nn.Conv2d):
-        head = nn.Sequential(
-                nn.Conv2d(in_channels=p.out_channels, out_channels=1, kernel_size=n, bias=p.bias),
-                nn.ModuleDict({
-                    n: nn.Conv2d(in_channels=1, out_channels=1, kernel_size=1, bias=p.bias)
-                    for n in ['reg', 'cls']
-                })
-        )
+    def _create_head(self, p, k, n):# nn.Conv2d):
+        head = nn.ModuleDict({
+            'cls': nn.Sequential(
+                nn.Conv2d(in_channels=p.out_channels, out_channels=p.out_channels, kernel_size=n, bias=p.bias),
+                nn.Conv2d(in_channels=p.out_channels, out_channels=k, kernel_size=1, bias=p.bias),
+            ),
+            'reg': nn.Sequential(
+                nn.Conv2d(in_channels=p.out_channels, out_channels=p.out_channels, kernel_size=n, bias=p.bias),
+                nn.Conv2d(in_channels=p.out_channels, out_channels=4*k, kernel_size=1, bias=p.bias),
+            )
+        })
         return head
     
     def _batch_element_forward(self, x: torch.Tensor):
         x = self.fpn(x)
-        x = self.heads(x)
-        return x
+        xs_cls = []
+        xs_reg = []
+        for head in self.heads.values():
+            x_cls, x_reg = [v(x) for k,v in head.values()] # cls, reg
+            xs_cls.append(x_cls)
+            xs_reg.append(x_reg)
+        return xs_cls, xs_reg
+    
+    @staticmethod
+    def _fake_batch(x):
+        return torch.unsqueeze(x, 0)
     
     def forward(self, x):
+        xs_cls = []
+        xs_reg = []
         if isinstance(x, torch.Tensor):
-            x = self._batch_element_forward(x)
+            x_cls, x_reg = self._batch_element_forward(self._fake_batch(x))
+            xs_cls.append(x_cls)
+            xs_reg.append(x_reg)
         else:
+            x_is_cls = []
+            x_is_reg = []
             for x_i in x:
-                x_i = self._batch_element_forward(x_i)
-        return x
+                x_i_cls, x_i_reg = self._batch_element_forward(self._fake_batch(x_i))
+                x_is_cls.append(x_i_cls)
+                x_is_reg.append(x_i_reg)
+            xs_cls.append(x_is_cls)
+            xs_reg.append(x_is_reg)
+            
+            xs_cls = tuple(xs_cls) #* Tuple: distinguish batces from non batches
+            xs_reg = tuple(xs_reg)
+        return xs_cls, xs_reg
+
+class RPNLoss(nn.Module):
+    def __init__(self, n_cls=256, n_reg=2400, reg_norm=10): #TODO: understand "number of anchor locations" for n_reg
+        super().__init__()
+        self.n_cls = n_cls
+        self.n_reg = n_reg
+        self.reg_norm = reg_norm
+        
+        self.logloss = nn.BCELoss()
+        self.smoothL1loss = nn.SmoothL1Loss()
+        
+    def forward(self, pred, target):
+        cls_pred, reg_pred = pred
+        cls_taget, reg_target = target
+        cls_loss = torch.sum(self.logloss(cls_pred, cls_taget)) / self.n_cls
+        reg_loss = torch.sum(torch.mul(cls_pred, self.smoothL1loss(reg_pred, reg_target))) * self.reg_norm / self.n_reg
+        
+        return torch.add(cls_loss, reg_loss)
 
 model = RPN(backbone=resnet50)
 # print(model)
 print(f"The model has {count_parameters(model):,} trainable parameters")
 
 #! wrong criterion for object classification
-criterion = nn.CrossEntropyLoss() # softmax + crossentropy
+criterion = RPNLoss()
 criterion = criterion.to(device)
 
 optimizer = optim.SGD(model.parameters(), lr=3e-3) # could be anything, like adam
@@ -316,6 +361,6 @@ train_losses, train_accs, valid_losses, valid_accs = model_training(N_EPOCHS,
                                                                     optimizer, 
                                                                     criterion, 
                                                                     device,
-                                                                    'rpm.pt')
+                                                                    'rpn.pt')
 
 plot_results(N_EPOCHS, train_losses, train_accs, valid_losses, valid_accs)
