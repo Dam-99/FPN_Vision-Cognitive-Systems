@@ -16,13 +16,14 @@ import copy
 import time
 import os
 import re
+import itertools as it
 # For results
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import classification_report
 # COCO
 from pycocotools.coco import COCO
 
-from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE, cache_empty, find_free_anns_ids, repair_empty, BROKEN_PATH
+from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE, cache_empty, find_free_anns_ids, repair_empty, BROKEN_PATH, get_iou
 
 device = torch.device('cuda')
 
@@ -325,22 +326,92 @@ class RPN(nn.Module):
         return xs_cls, xs_reg
 
 class RPNLoss(nn.Module):
-    def __init__(self, n_cls=256, n_reg=2400, reg_norm=10): #TODO: understand "number of anchor locations" for n_reg
+    def __init__(self, reg_norm=10): #TODO: no hardcode n_cls, n_reg in init
         super().__init__()
-        self.n_cls = n_cls
-        self.n_reg = n_reg
+        self.n_cls = BATCH_SIZE
+        self.n_reg = 2400 #? "number of anchor locations" but not sure how they get this number
         self.reg_norm = reg_norm
         
-        self.logloss = nn.BCELoss()
-        self.smoothL1loss = nn.SmoothL1Loss()
+        self.logloss = nn.functional.binary_cross_entropy
+        self.smoothL1loss = nn.functional.smooth_l1_loss
         
     def forward(self, pred, target):
+        print("-- Computing loss...")
         cls_pred, reg_pred = pred
-        cls_taget, reg_target = target
-        cls_loss = torch.sum(self.logloss(cls_pred, cls_taget)) / self.n_cls
-        reg_loss = torch.sum(torch.mul(cls_pred, self.smoothL1loss(reg_pred, reg_target))) * self.reg_norm / self.n_reg
+        cls_target = [] # these needs to be tensors
+        reg_target = []
+        start_loss = time.time()
+        for y_i in target:
+            t_i = torch.any(torch.ne(y_i['labels'], 0)).to(device), y_i['boxes'] 
+            cls_target.append(t_i[0])
+            reg_target.append(t_i[1])
         
+        cls_loss, reg_loss = self._compute_losses_tensors(cls_pred, reg_pred, reg_target)
+        cls_loss = torch.div(torch.sum(cls_loss).item(), self.n_cls)
+        reg_loss = torch.div(torch.sum(reg_loss).item(), self.n_reg)
+        print(f"   Loss time: {(time.time() - start_loss):.2f}s")
         return torch.add(cls_loss, reg_loss)
+    
+    def _compute_losses_tensors(self, anchors, anchors_boxes, reg_target):
+        b_size = len(reg_target)
+        n_heads = len(anchors)
+        img_n_anchor, img_w, img_h = anchors[0][0].shape
+        
+        cls_pred = torch.stack([head.clone().detach() for head in anchors]).permute(1,0,3,4,2).contiguous()
+        reg_pred = torch.stack([head.clone().detach() for head in anchors_boxes]).permute(1,0,3,4,2).view(b_size, n_heads, img_w, img_h, img_n_anchor, 4).contiguous()
+        labels = torch.full(size=cls_pred.shape, fill_value=-1, dtype=torch.float32).contiguous().to(device)
+        labels_gtb = torch.zeros(size=cls_pred.shape, dtype=torch.int).contiguous()
+        anchor_count_wrong = torch.zeros(size=cls_pred.shape, dtype=torch.int).contiguous()
+        cls_loss = torch.zeros(size=torch.Size([b_size])).contiguous() # tensors containing the loss for each image
+        reg_loss = torch.zeros(size=torch.Size([b_size])).contiguous()
+        
+        gtb_max_anchor = []
+        for t in reg_target:
+            # no_bg_target_boxes.append(t['boxes'][t['labels'].ne(0)]) #? class 0 already removed in forward
+            gtb_max_anchor.append(torch.zeros(size=torch.Size([len(t),5]), dtype=torch.int))
+            
+        gtb_count = 0
+        heads, widths, heights, anchs = range(n_heads), range(img_w), range(img_h), range(img_n_anchor)
+        for i, t in enumerate(reg_target): # i represents the batch size/element, t is a tensor with all the boxes's coordinates
+            tbs = t
+            gtb_count += len(tbs) # should be just the number of boxes, not also ,4
+            for head, w, h, a in it.product(heads, widths, heights, anchs):
+                skip = False
+                for j, gtb_tensor in enumerate(tbs):
+                    if skip: break
+                    anchor = reg_pred[i][head][w][h][a].tolist()
+                    gtb = gtb_tensor.tolist()
+                    iou = get_iou(anchor, gtb)
+                    if iou > gtb_max_anchor[i][j][4]:
+                        gtb_max_anchor[i][j] = torch.tensor([head, w, h, a, iou])
+                    if iou >= 0.7:
+                        labels[i][head][w][h][a] = 1
+                        labels_gtb[i][head][w][h][a] = j
+                        skip = True
+                        continue
+                    if iou < 0.3:
+                        anchor_count_wrong[i][head][w][h][a] += 1
+            # append pred for each image
+            # cls_pred += pred[i][labels.ne(-1)]
+            # reg_pred += anchors_boxes[i][labels.ne(-1).ne(0)] # this should be equivalent to multiplying it with the label
+        labels[anchor_count_wrong.eq(gtb_count)] = 0
+        # set anchors' labels to 1 for max gtb
+        for i in range(b_size):
+            max_gtb_i = gtb_max_anchor[i]
+            for coords in max_gtb_i.tolist():
+                head,w,h,a,_ = [int(c) for c in coords]
+                labels[i][head][w][h][a] = 1
+        # filter anchors according to label
+        cls_pred = cls_pred[labels.ne(-1)]#.reshape(cls_pred_shape) #TOFIX: shapes 
+        reg_pred = reg_pred[labels.ne(-1)]#.reshape(reg_pred_shape)
+        labels = labels[labels.ne(-1)] # probably needed for keeping the same shape
+        # compute cls_loss
+        cls_loss = self.logloss(cls_pred, labels)
+        # compute reg_loss using the correct label
+        reg_loss = [self.smoothL1loss(reg_pred[i], reg_target[i]) for i in range(b_size)]
+        reg_loss = torch.tensor([torch.sum(rli) for rli in reg_loss])
+        
+        return cls_loss, reg_loss
 
 model = RPN(backbone=resnet50)
 # print(model)

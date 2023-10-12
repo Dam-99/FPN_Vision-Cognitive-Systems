@@ -254,3 +254,40 @@ def find_free_anns_ids(anns_sorted, free_ann_ids, missing):
       elif finished:
         break
       last = ann_id
+      
+def _clip_negative_corner(a):
+  return [x if x >= 0 else 0 for x in a]
+def _order_corners(c1, c2):
+  return (c1, c2) if c1 <= c2 else (c2, c1)
+def _compare_corners(c1,c2, d1, d2):
+  w1 = min(c1,d1)
+  w2 = c2 if w1 == c1 else d2
+  z1 = max(c1,d1)
+  z2 = d2 if z1 == d1 else c2
+  return w1, w2, z1, z2
+def _segment_intersection(w2, z1, z2): #w1 will never be > z1 because it's computed as the min
+  return min(z2, w2) - z1 if z1 < w2 else 0 
+
+def get_iou(a, b, max_size=0): #todo (maybe): sanitize for image size
+  a = _clip_negative_corner(a)
+  b = _clip_negative_corner(b)
+  ax1, ay1, ax2, ay2 = a
+  bx1, by1, bx2, by2 = b
+  ax1, ax2 = _order_corners(ax1, ax2)
+  ay1, ay2 = _order_corners(ay1, ay2)
+  bx1, bx2 = _order_corners(bx1, bx2)
+  by1, by2 = _order_corners(by1, by2)
+
+  # w refers to the box with the top-left corner closest to the origin in that axis
+  wx1, wx2, zx1, zx2 = _compare_corners(ax1, ax2, bx1, bx2)
+  wy1, wy2, zy1, zy2 = _compare_corners(ay1, ay2, by1, by2)
+  
+  hor_side = _segment_intersection(wx2, zx1, zx2)
+  ver_side = _segment_intersection(wy2, zy1, zy2)
+  
+  intersection = hor_side * ver_side
+  area_a = (ax2-ax1) * (ay2-ay1)
+  area_b = (bx2-bx1) * (by2-by1)
+  union = area_a + area_b - intersection
+  
+  return intersection / union if union != 0 else 0
