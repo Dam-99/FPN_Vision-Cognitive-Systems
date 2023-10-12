@@ -277,7 +277,7 @@ class RPN(nn.Module):
                 for name, pi in self.fpn.ps.items() #TODO: check how many layers the backbone has to make it more automatic
             })
         
-    def _create_head(self, p, k, n):# nn.Conv2d):
+    def _create_head(self, p, k, n):# nn.Conv2d, k, n):
         head = nn.ModuleDict({
             'cls': nn.Sequential(
                 nn.Conv2d(in_channels=p.out_channels, out_channels=p.out_channels, kernel_size=n, bias=p.bias),
@@ -290,38 +290,47 @@ class RPN(nn.Module):
         })
         return head
     
-    def _batch_element_forward(self, x: torch.Tensor):
+    def _batch_element_fpn_run(self, x: torch.Tensor):
         x = self.fpn(x)
+        return x
+    
+    def _rpn_forward(self, x: torch.Tensor):
         xs_cls = []
         xs_reg = []
         for head in self.heads.values():
-            x_cls, x_reg = [v(x) for k,v in head.values()] # cls, reg
+            x_cls, x_reg = [v(x) for v in head.values()]
             xs_cls.append(x_cls)
             xs_reg.append(x_reg)
-        return xs_cls, xs_reg
+        return xs_cls, xs_reg #* understand how to return the values here so that they can be used later (also for the forward result) -- a tuple should be ok
     
     @staticmethod
     def _fake_batch(x):
         return torch.unsqueeze(x, 0)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor | tuple[torch.Tensor]):
         xs_cls = []
         xs_reg = []
+        # After going through fpn, everything should be of the same size so i can batch it and optimize stuff a bit
         if isinstance(x, torch.Tensor):
-            x_cls, x_reg = self._batch_element_forward(self._fake_batch(x))
+            x = self._batch_element_fpn_run(x)#self._fake_batch(x))
+            x_cls, x_reg = self._rpn_forward(x)
             xs_cls.append(x_cls)
             xs_reg.append(x_reg)
         else:
-            x_is_cls = []
-            x_is_reg = []
-            for x_i in x:
-                x_i_cls, x_i_reg = self._batch_element_forward(self._fake_batch(x_i))
-                x_is_cls.append(x_i_cls)
-                x_is_reg.append(x_i_reg)
-            xs_cls.append(x_is_cls)
-            xs_reg.append(x_is_reg)
-            
-            xs_cls = tuple(xs_cls) #* Tuple: distinguish batces from non batches
+            bi = 0
+            # print("-- Batch images' times:")
+            # start = time.time()
+            # TODO: find a way to not hardcode it
+            batch_x_shape = len(x), self.fpn._d, int(x[0].shape[1]/4), int(x[0].shape[2]/4) # batch_size, channels, h, w
+            batch_x = torch.empty(size=batch_x_shape).to(device)
+            for i, x_i in enumerate(x):
+                start_i = time.time()
+                batch_x[i] = self._batch_element_fpn_run(self._fake_batch(x_i)).squeeze(dim=0)
+                print(f"     {bi+1}/{BATCH_SIZE}: {(time.time() - start_i):.2f}s")
+                bi+=1
+            xs_cls, xs_reg = self._rpn_forward(batch_x)
+            # print(f"-- Batch total time: {(time.time() - start):.2f}")
+            xs_cls = tuple(xs_cls) #* Make them tuples to distinguish batces from non batches
             xs_reg = tuple(xs_reg)
         return xs_cls, xs_reg
 

@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 import json
+import re
 
 MODELS_PATH = 'models/'
 BATCH_SIZE = 256
@@ -35,18 +36,32 @@ def calculate_accuracy(y_pred, y):
 
   return accuracy
 
-def train(model, iterator, optimizer, criterion, device):
+def train(model, iterator, optimizer, criterion, device, batches_percentage=0.7):
   epoch_loss = 0
-  epoch_acc = 0
-
+  # epoch_acc = 0
+  
   # Apply train mode
   model.train()
-
+  mem = []
+  iters = 0
+  max_batches = int(len(iterator)*batches_percentage)
   for (x,y) in iterator:
-    # x = x.to(device)
+    # if iters % 100 == 0: 
+    #   if iters!= 0: 
+    #     for i in range(5): print(UP, end=CLEAR)
+    print(f"BATCH {iters+1}/{max_batches}")
+    print("Allocated before gc: ", torch.cuda.memory_allocated()*1e-9)
+    gc.collect()
+    print("Allocated: ", torch.cuda.memory_allocated()*1e-9)
+    print("Reserved: ", torch.cuda.memory_reserved()*1e-9)
+    torch.cuda.empty_cache()
+    mem.append(torch.cuda.memory_allocated()*1e-9)
+    print("Reserved after empty cache: ", torch.cuda.memory_reserved()*1e-9)
     x = list(x)
+    shapes = []
     for i, x_i in enumerate(x):
       x[i] = x_i.to(device).float()
+      shapes.append((x_i.shape[1], x_i.shape[2]))
     x = tuple(x)
     
     if type(y) != list and type(y) != tuple:
@@ -56,6 +71,7 @@ def train(model, iterator, optimizer, criterion, device):
         for k in y_i.keys():
           if isinstance(y_i[k], torch.Tensor): # boxes, masks, labels
             y[i][k] = y_i[k].to(device)
+        y[i]['img_size'] = shapes[i][-2:]
     else:
       y = [y_i.to(device) for y_i in y]
     
@@ -64,40 +80,60 @@ def train(model, iterator, optimizer, criterion, device):
     
     # Make Predictions
     y_pred = model(x)
+    mem.append(torch.cuda.memory_allocated()*1e-9)
+    torch.cuda.empty_cache()
 
     # Compute loss
     loss = criterion(y_pred, y)
+    torch.cuda.empty_cache()
     
     # Compute accuracy
-    acc = calculate_accuracy(y_pred, y)
+    # acc = calculate_accuracy(y_pred, y)
 
     # Backprop
+    bw_start = time.time()
     loss.backward()
-
+    torch.cuda.empty_cache()
+    print(f"-- Backward time: {(time.time() - bw_start):.2f}s")
+    
     # Apply optimizer
     optimizer.step()
 
     # Extract data from loss and accuracy
     epoch_loss += loss.item()
-    epoch_acc += acc.item()
+    # epoch_acc += acc.item()
+    del loss
+    
+    iters += 1
+    if iters >= max_batches: break
+  return epoch_loss/iters, 0, mem#epoch_acc/len(iterator)
 
-  return epoch_loss/len(iterator), epoch_acc/len(iterator)
-
-def evaluate(model, iterator, criterion, device):
+def evaluate(model, iterator, criterion, device, batches_percentage=0.4):
   epoch_loss = 0
-  epoch_acc = 0
+  # epoch_acc = 0
 
   # Evaluation mode
   model.eval()
 
   # Do not compute gradients
   with torch.no_grad():
-
+    iters=0
+    mem_val=[]
+    max_batches = int(len(iterator)*batches_percentage)
     for (x,y) in iterator:
-      # x = x.to(device)
+      print(f"BATCH {iters+1}/{max_batches}")
+      print("Allocated before gc: ", torch.cuda.memory_allocated()*1e-9)
+      gc.collect()
+      print("Allocated: ", torch.cuda.memory_allocated()*1e-9)
+      print("Reserved: ", torch.cuda.memory_reserved()*1e-9)
+      torch.cuda.empty_cache()
+      mem_val.append(torch.cuda.memory_allocated()*1e-9)
+      print("Reserved after empty cache: ", torch.cuda.memory_reserved()*1e-9)
       x = list(x)
+      shapes = []
       for i, x_i in enumerate(x):
         x[i] = x_i.to(device).float()
+        shapes.append((x_i.shape[1], x_i.shape[2]))
       x = tuple(x)
       
       if type(y) != list and type(y) != tuple:
@@ -107,25 +143,32 @@ def evaluate(model, iterator, criterion, device):
           for k in y_i.keys():
             if isinstance(y_i[k], torch.Tensor): # boxes, masks, labels
               y[i][k] = y_i[k].to(device)
+          y[i]['img_size'] = shapes[i][-2:]
       else:
         y = [y_i.to(device) for y_i in y]
       
       # Make Predictions
       y_pred = model(x)
+      mem_val.append(torch.cuda.memory_allocated()*1e-9)
+      torch.cuda.empty_cache()
 
       # Compute loss
       loss = criterion(y_pred, y)
+      torch.cuda.empty_cache()
       
       # Compute accuracy
-      acc = calculate_accuracy(y_pred, y)
+      # acc = calculate_accuracy(y_pred, y)
 
       # Extract data from loss and accuracy
       epoch_loss += loss.item()
-      epoch_acc += acc.item()
+      # epoch_acc += acc.item()
+      del loss
+      
+      iters += 1
+      if iters >= max_batches: break
+  return epoch_loss/iters, 0, mem_val#epoch_acc/len(iterator)
 
-  return epoch_loss/len(iterator), epoch_acc/len(iterator)
-
-def model_training(n_epochs, model, train_iterator, valid_iterator, optimizer, criterion, device, model_name='best_model.pt'):
+def model_training(n_epochs, model, train_iterator, val_iterator, optimizer, criterion, device, model_name='models/best_model', batches_percentage=0.7, load=None):
   # models saved in subfolder
   if not model_name.startswith((f'{MODELS_PATH}', f'./{MODELS_PATH}')):
     model_name = f'{MODELS_PATH}{model_name}'
@@ -135,38 +178,60 @@ def model_training(n_epochs, model, train_iterator, valid_iterator, optimizer, c
   best_valid_loss = float('inf')
 
   # Save output losses, accs
+  
   train_losses = []
-  train_accs = []
+  # train_accs = []
   valid_losses = []
-  valid_accs = []
+  # valid_accs = []
+  train_mem = []
+  valid_mem = []
 
+  if load is not None:
+    model.load_state_dict(torch.load(load))
+    n = re.findall(r'\d+', load)
+    n = list(map(int, n))[0]
+    range_epochs = range(n,n_epochs)
+  else:
+    range_epochs = range(n_epochs)
+  
   # Loop over epochs
-  for epoch in range(n_epochs):
+  for epoch in range_epochs:
+    torch.save(model.state_dict(), f'{MODELS_PATH}/epoch_{epoch}_before_training.pt')
     start_time = time.time()
     
+    print(f"\nEpoch: {epoch+1}/{n_epochs}")
+    print("---------------------------------")
     # Train
-    train_loss, train_acc = train(model, train_iterator, optimizer, criterion, device)
+    print("   Training")
+    print("--------------")
+    train_loss, train_acc, tm = train(model, train_iterator, optimizer, criterion, device, batches_percentage)
+    torch.save(model.state_dict(), f'{MODELS_PATH}/epoch_{epoch}_between_training.pt')
     # Validation
-    valid_loss, valid_acc = evaluate(model, valid_iterator, criterion, device)
+    print("--------------")
+    print("  Validation")
+    print("--------------")
+    valid_loss, valid_acc, vm = evaluate(model, val_iterator, criterion, device, batches_percentage/2)
     # Save best model
     if valid_loss < best_valid_loss:
       best_valid_loss = valid_loss
       # Save model
-      torch.save(model.state_dict(), model_name)
+      torch.save(model.state_dict(), f'{model_name}_ep{epoch}.pt')
     end_time = time.time()
     
-    print(f"\nEpoch: {epoch+1}/{n_epochs} -- Epoch Time: {end_time-start_time:.2f} s")
-    print("---------------------------------")
+    print(f"Time: {end_time-start_time:.2f} s")
     print(f"Train -- Loss: {train_loss:.3f}, Acc: {train_acc * 100:.2f}%")
     print(f"Val -- Loss: {valid_loss:.3f}, Acc: {valid_acc * 100:.2f}%")
 
     # Save
     train_losses.append(train_loss)
-    train_accs.append(train_acc)
+    # train_accs.append(train_acc)
+    train_mem.append(tm)
     valid_losses.append(valid_loss)
-    valid_accs.append(valid_acc)
+    # valid_accs.append(valid_acc)
+    valid_mem.append(vm)
 
-  return train_losses, train_accs, valid_losses, valid_accs
+    torch.save(model.state_dict(), f'{MODELS_PATH}/epoch_{epoch}_after_training.pt')
+  return train_losses, valid_losses, train_mem, valid_mem#train_accs, valid_losses, valid_accs
 
 def plot_results(n_epochs, train_losses, train_accs, valid_losses, valid_accs):
   N_EPOCHS = n_epochs
