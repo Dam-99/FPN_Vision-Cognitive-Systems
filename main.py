@@ -337,96 +337,128 @@ class RPN(nn.Module):
 class RPNLoss(nn.Module):
     def __init__(self, reg_norm=10): #TODO: no hardcode n_cls, n_reg in init
         super().__init__()
-        self.n_cls = BATCH_SIZE
-        self.n_reg = 2400 #? "number of anchor locations" but not sure how they get this number
+        # self.n_cls = BATCH_SIZE
+        # self.n_reg = 2400 #? "number of anchor locations" but not sure how they get this number
         self.reg_norm = reg_norm
+        self.NEGATIVE_INDICATOR = -1
+        self.IGNORED_INDICATOR = -2
+        self.low_threshold = 0.3
+        self.high_threshold = 0.7
+        self.sample_size = 256
         
-        self.logloss = nn.functional.binary_cross_entropy
+        self.logloss = nn.functional.binary_cross_entropy_with_logits
         self.smoothL1loss = nn.functional.smooth_l1_loss
         
-    def forward(self, pred, target):
+    def forward(self, preds, ds_target):
         print("-- Computing loss...")
-        cls_pred, reg_pred = pred
-        cls_target = [] # these needs to be tensors
-        reg_target = []
+        num_imgs = len(ds_target)
+        cls_preds, reg_preds = preds
+        targets = []
         start_loss = time.time()
-        for y_i in target:
-            t_i = torch.any(torch.ne(y_i['labels'], 0)).to(device), y_i['boxes'] 
-            cls_target.append(t_i[0])
-            reg_target.append(t_i[1])
+        for y_i in ds_target:
+            t_i = {'labels': y_i['labels'], 'boxes': y_i['boxes'] }
+            targets.append(t_i)
         
-        cls_loss, reg_loss = self._compute_losses_tensors(cls_pred, reg_pred, reg_target)
-        cls_loss = torch.div(torch.sum(cls_loss).item(), self.n_cls)
-        reg_loss = torch.div(torch.sum(reg_loss).item(), self.n_reg)
+        cls_preds, reg_preds = self._concat_boxes(cls_preds, reg_preds)
+        
+        reg_preds = reg_preds.view(num_imgs, -1, 4)
+        labels, matched_gt_boxes = self._assign_targets_to_anchors(reg_preds, targets)
+        reg_preds = reg_preds.view(-1, 4)
+        
+        cls_loss, reg_loss = self._compute_loss(cls_preds, reg_preds, labels, matched_gt_boxes)
+        
         print(f"   Loss time: {(time.time() - start_loss):.2f}s")
         return torch.add(cls_loss, reg_loss)
+
+    def _permute_and_flatten(self, head, N, A, C, H, W):
+        head = head.view(N, -1, C, H, W)
+        head = head.permute(0, 3, 4, 1, 2)
+        head = head.reshape(N, -1, C)
+        return head
+
+    def _concat_boxes(self, boxes_cls, boxes_reg):
+        box_cls_flattened = []
+        box_reg_flattened = []
+        for box_cls_per_level, box_reg_per_level in zip(boxes_cls, boxes_reg):
+            N, AxC, H, W = box_cls_per_level.shape
+            Ax4 = box_reg_per_level.shape[1]
+            A = Ax4 // 4
+            C = AxC // A
+            box_cls_per_level = self._permute_and_flatten(box_cls_per_level, N, A, C, H, W)
+            box_cls_flattened.append(box_cls_per_level)
+
+            box_reg_per_level = self._permute_and_flatten(box_reg_per_level, N, A, 4, H, W)
+            box_reg_flattened.append(box_reg_per_level)
+        box_cls = torch.cat(box_cls_flattened, dim=1).flatten(0, -2)#.detach()
+        box_reg = torch.cat(box_reg_flattened, dim=1).reshape(-1, 4)#.detach()
+        return box_cls, box_reg
     
-    def _compute_losses_tensors(self, anchors, anchors_boxes, reg_target):
-        b_size = len(reg_target)
-        n_heads = len(anchors)
-        img_n_anchor, img_w, img_h = anchors[0][0].shape
+    def _assign_targets_to_anchors(self, anchors, targets):
+        labels = []
+        matched_gt_boxes = []
+        for anchors_per_image, targets_per_image in zip(anchors, targets):
+            gt_boxes = targets_per_image["boxes"]
+            bg_boxes_exist = False #gt_boxes.any(gt_boxes.eq(0))
+            if gt_boxes.numel() == 0 or bg_boxes_exist:
+                # Background image (negative example) #* can probs leave this as is because the only bg images are the ones i made (so 1 box only)
+                device = anchors_per_image.device
+                matched_gt_boxes_per_image = torch.zeros(anchors_per_image.shape, dtype=torch.float32, device=device)
+                labels_per_image = torch.zeros((anchors_per_image.shape[0],), dtype=torch.float32, device=device)
+            else:
+                match_quality_matrix = get_iou(gt_boxes, anchors_per_image)
+                matched_idxs = self._proposal_matcher(match_quality_matrix)
+                
+                matched_gt_boxes_per_image = gt_boxes[matched_idxs.clamp(min=0)]
+
+                labels_per_image = matched_idxs >= 0
+                labels_per_image = labels_per_image.to(dtype=torch.float32)
+                
+                # Negative examples
+                bg_indices = matched_idxs == self.NEGATIVE_INDICATOR
+                labels_per_image[bg_indices] = 0.0
+                # Irrelevant example
+                inds_to_discard = matched_idxs == self.IGNORED_INDICATOR
+                labels_per_image[inds_to_discard] = -1.0
+                
+            labels.append(labels_per_image)
+            matched_gt_boxes.append(matched_gt_boxes_per_image)
+        return labels, matched_gt_boxes
+                
+    def _proposal_matcher(self, match_quality_matrix):
+        matched_vals, matches = match_quality_matrix.max(dim=0)
+        all_matches = matches.clone()
+        below_low_threshold = matched_vals < self.low_threshold
+        between_thresholds = (matched_vals >= self.low_threshold) & (matched_vals < self.high_threshold)
+        matches[below_low_threshold] = self.NEGATIVE_INDICATOR
+        matches[between_thresholds] = self.IGNORED_INDICATOR
         
-        cls_pred = torch.stack([head.clone().detach() for head in anchors]).permute(1,0,3,4,2).contiguous()
-        reg_pred = torch.stack([head.clone().detach() for head in anchors_boxes]).permute(1,0,3,4,2).view(b_size, n_heads, img_w, img_h, img_n_anchor, 4).contiguous()
-        labels = torch.full(size=cls_pred.shape, fill_value=-1, dtype=torch.float32).contiguous().to(device)
-        labels_gtb = torch.zeros(size=cls_pred.shape, dtype=torch.int).contiguous()
-        anchor_count_wrong = torch.zeros(size=cls_pred.shape, dtype=torch.int).contiguous()
-        cls_loss = torch.zeros(size=torch.Size([b_size])).contiguous() # tensors containing the loss for each image
-        reg_loss = torch.zeros(size=torch.Size([b_size])).contiguous()
+        highest_quality_foreach_gt, _ = match_quality_matrix.max(dim=1)
+        gt_pred_pairs_of_highest_quality = torch.where(match_quality_matrix == highest_quality_foreach_gt[:, None])
+        # Example gt_pred_pairs_of_highest_quality:
+        # tuple(tensor([0, 1, 1, 2, 2, 3, 3, 4, 5, 5]),
+        #           tensor([39796, 32055, 32070, 39190, 40255, 40390, 41455, 45470, 45325, 46390]))
+        # Each element in the first tensor is a gt index, and ea3ch element in second tensor is a prediction index
+        # Note how gt items 1, 2, 3, and 5 each have two ties
+        # So in my case, with 11k ties, it's repeated 11k times
+        pred_inds_to_update = gt_pred_pairs_of_highest_quality[1]
+        matches[pred_inds_to_update] = all_matches[pred_inds_to_update]
+        return matches
+
+    def _compute_loss(self, cls_preds, reg_preds, labels, reg_targets):
+        cls_preds = cls_preds.flatten()
         
-        gtb_max_anchor = []
-        for t in reg_target:
-            # no_bg_target_boxes.append(t['boxes'][t['labels'].ne(0)]) #? class 0 already removed in forward
-            gtb_max_anchor.append(torch.zeros(size=torch.Size([len(t),5]), dtype=torch.int))
-            
-        gtb_count = 0
-        heads, widths, heights, anchs = range(n_heads), range(img_w), range(img_h), range(img_n_anchor)
-        for i, t in enumerate(reg_target): # i represents the batch size/element, t is a tensor with all the boxes's coordinates
-            tbs = t
-            gtb_count += len(tbs) # should be just the number of boxes, not also ,4
-            for head, w, h, a in it.product(heads, widths, heights, anchs):
-                skip = False
-                for j, gtb_tensor in enumerate(tbs):
-                    if skip: break
-                    anchor = reg_pred[i][head][w][h][a].tolist()
-                    gtb = gtb_tensor.tolist()
-                    iou = get_iou(anchor, gtb)
-                    if iou > gtb_max_anchor[i][j][4]:
-                        gtb_max_anchor[i][j] = torch.tensor([head, w, h, a, iou])
-                    if iou >= 0.7:
-                        labels[i][head][w][h][a] = 1
-                        labels_gtb[i][head][w][h][a] = j
-                        skip = True
-                        continue
-                    if iou < 0.3:
-                        anchor_count_wrong[i][head][w][h][a] += 1
-            # append pred for each image
-            # cls_pred += pred[i][labels.ne(-1)]
-            # reg_pred += anchors_boxes[i][labels.ne(-1).ne(0)] # this should be equivalent to multiplying it with the label
-        labels[anchor_count_wrong.eq(gtb_count)] = 0
-        # set anchors' labels to 1 for max gtb
-        for i in range(b_size):
-            max_gtb_i = gtb_max_anchor[i]
-            for coords in max_gtb_i.tolist():
-                head,w,h,a,_ = [int(c) for c in coords]
-                labels[i][head][w][h][a] = 1
-        # filter anchors according to label
-        cls_pred = cls_pred[labels.ne(-1)]#.reshape(cls_pred_shape) #TOFIX: shapes 
-        reg_pred = reg_pred[labels.ne(-1)]#.reshape(reg_pred_shape)
-        labels = labels[labels.ne(-1)] # probably needed for keeping the same shape
-        # compute cls_loss
-        cls_loss = self.logloss(cls_pred, labels)
-        # compute reg_loss using the correct label
-        reg_loss = [self.smoothL1loss(reg_pred[i], reg_target[i]) for i in range(b_size)]
-        reg_loss = torch.tensor([torch.sum(rli) for rli in reg_loss])
+        labels = torch.cat(labels, dim=0)
+        reg_targets = torch.cat(reg_targets, dim=0)
         
+        cls_loss = self.logloss(cls_preds, labels)
+        reg_loss = self.smoothL1loss(reg_preds, reg_targets, beta=1/9, reduction="sum") / reg_preds.numel()      
+
         return cls_loss, reg_loss
 
 model = RPN(backbone=resnet50)
 # print(model)
-print(f"The model has {count_parameters(model):,} trainable parameters")
+# print(f"The model has {count_parameters(model):,} trainable parameters")
 
-#! wrong criterion for object classification
 criterion = RPNLoss()
 criterion = criterion.to(device)
 
@@ -434,13 +466,16 @@ optimizer = optim.SGD(model.parameters(), lr=3e-3) # could be anything, like ada
 model = model.to(device)
 
 N_EPOCHS = 25
-train_losses, train_accs, valid_losses, valid_accs = model_training(N_EPOCHS, 
+train_losses, valid_losses, train_mem, valid_mem = model_training(N_EPOCHS, 
                                                                     model, 
                                                                     train_iterator, 
                                                                     val_iterator, 
                                                                     optimizer, 
                                                                     criterion, 
                                                                     device,
-                                                                    'rpn.pt')
+                                                                    'rpn',
+                                                                    0.005
+                                                                    )
 
-plot_results(N_EPOCHS, train_losses, train_accs, valid_losses, valid_accs)
+# plot_results(N_EPOCHS, train_losses, valid_losses)#, train_accs, valid_accs)
+plot_results(N_EPOCHS, train_losses, valid_losses, train_mem, valid_mem)
