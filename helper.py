@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import time
 import json
 import re
+import gc
 
 MODELS_PATH = 'models/'
 BATCH_SIZE = 256
@@ -379,3 +380,7 @@ def get_iou(boxes1, boxes2) :
     union = area1[:, None] + area2 - intersection
     
     return intersection/union
+  
+class TanhModule(torch.nn.Module):
+  def forward(self, x):
+      return torch.add(torch.tanh(x), 1)

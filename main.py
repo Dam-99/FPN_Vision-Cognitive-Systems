@@ -23,7 +23,7 @@ from sklearn.metrics import classification_report
 # COCO
 from pycocotools.coco import COCO
 
-from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE, cache_empty, find_free_anns_ids, repair_empty, BROKEN_PATH, get_iou
+from helper import calculate_accuracy, model_training, plot_results, count_parameters, BATCH_SIZE, cache_empty, find_free_anns_ids, repair_empty, BROKEN_PATH, get_iou, TanhModule
 
 device = torch.device('cuda')
 
@@ -50,18 +50,44 @@ def labels_getter(inputs):
         return inputs[1]['labels']
 
 #? see FPN's _lateral method for disclaimer
-train_transforms = transforms_v2.Compose([
-                                            transforms_v2.ToImageTensor(),
-                                            transforms_v2.Resize((640, 640), antialias=True),
-                                            transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
-                                            # transforms_v2.SanitizeBoundingBox(),
-])
-test_transforms = transforms_v2.Compose([
-                                            transforms_v2.ToImageTensor(),
-                                            transforms_v2.Resize((640, 640), antialias=True),
-                                            transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
-                                            # transforms_v2.SanitizeBoundingBox(),
-])
+size = 640, 640
+augment = False
+if augment:
+        train_transforms = transforms_v2.Compose([
+                                                    transforms_v2.ToImageTensor(),
+                                                    transforms_v2.Resize(size, antialias=True),
+                                                    # transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
+                                                    transforms_v2.RandomGrayscale(0.2),
+                                                    transforms_v2.RandomVerticalFlip(0.4),
+                                                    transforms_v2.RandomHorizontalFlip(),
+                                                    transforms_v2.RandomPerspective(p=0.3),
+                                                    transforms_v2.RandomResizedCrop(size=size, antialias=True),
+                                                    transforms_v2.SanitizeBoundingBox(),
+        ])
+        test_transforms = transforms_v2.Compose([
+                                                    transforms_v2.ToImageTensor(),
+                                                    transforms_v2.Resize(size, antialias=True),
+                                                    # transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
+                                                    transforms_v2.RandomGrayscale(0.2),
+                                                    transforms_v2.RandomVerticalFlip(0.4),
+                                                    transforms_v2.RandomHorizontalFlip(),
+                                                    transforms_v2.RandomPerspective(p=0.3),
+                                                    transforms_v2.RandomResizedCrop(size=size, antialias=True),
+                                                    transforms_v2.SanitizeBoundingBox(),
+        ])
+else:
+        train_transforms = transforms_v2.Compose([
+                                                    transforms_v2.ToImageTensor(),
+                                                    transforms_v2.Resize(size, antialias=True),
+                                                    # transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
+                                                    transforms_v2.SanitizeBoundingBox(),
+        ])
+        test_transforms = transforms_v2.Compose([
+                                                    transforms_v2.ToImageTensor(),
+                                                    transforms_v2.Resize(size, antialias=True),
+                                                    # transforms_v2.SanitizeBoundingBox(labels_getter=labels_getter),
+                                                    transforms_v2.SanitizeBoundingBox(),
+        ])
 
 def load_data():
     if DS_TYPE:
@@ -272,12 +298,18 @@ class RPN(nn.Module):
     def __init__(self, backbone: nn.Module = default_backbone, k=3, n=3, d=256, batch_size=BATCH_SIZE) -> None:
         super().__init__()
         self.fpn = FPN(backbone, d, batch_size)
+        self.tanh = TanhModule()
+        for param in self.tanh.parameters():
+            param.requires_grad_(False)
         self.heads = nn.ModuleDict({
             f'h_{name}': self._create_head(pi, k, n)
                 for name, pi in self.fpn.ps.items() #TODO: check how many layers the backbone has to make it more automatic
             })
         
     def _create_head(self, p, k, n):# nn.Conv2d, k, n):
+        r_conv = nn.Conv2d(in_channels=p.out_channels, out_channels=4*k, kernel_size=1, bias=p.bias)
+        r = r_conv
+        # r = nn.utils.parametrize.register_parametrization(r_conv, "weight", TanhModule())
         head = nn.ModuleDict({
             'cls': nn.Sequential(
                 nn.Conv2d(in_channels=p.out_channels, out_channels=p.out_channels, kernel_size=n, bias=p.bias),
@@ -285,7 +317,7 @@ class RPN(nn.Module):
             ),
             'reg': nn.Sequential(
                 nn.Conv2d(in_channels=p.out_channels, out_channels=p.out_channels, kernel_size=n, bias=p.bias),
-                nn.Conv2d(in_channels=p.out_channels, out_channels=4*k, kernel_size=1, bias=p.bias),
+                r,
             )
         })
         return head
@@ -329,6 +361,8 @@ class RPN(nn.Module):
                 print(f"     {bi+1}/{BATCH_SIZE}: {(time.time() - start_i):.2f}s")
                 bi+=1
             xs_cls, xs_reg = self._rpn_forward(batch_x)
+            xs_reg = [self.tanh(x_reg) for x_reg in xs_reg]
+            xs_reg = [x_reg.mul(size[0]).div(2) for x_reg in xs_reg]
             # print(f"-- Batch total time: {(time.time() - start):.2f}")
             xs_cls = tuple(xs_cls) #* Make them tuples to distinguish batces from non batches
             xs_reg = tuple(xs_reg)
