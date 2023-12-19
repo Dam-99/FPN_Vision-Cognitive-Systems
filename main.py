@@ -353,6 +353,7 @@ class RPN(nn.Module):
             # print("-- Batch images' times:")
             # start = time.time()
             # TODO: find a way to not hardcode it
+            img_size = x[0].shape[-2:]
             batch_x_shape = len(x), self.fpn._d, int(x[0].shape[1]/4), int(x[0].shape[2]/4) # batch_size, channels, h, w
             batch_x = torch.empty(size=batch_x_shape).to(device)
             for i, x_i in enumerate(x):
@@ -362,11 +363,47 @@ class RPN(nn.Module):
                 bi+=1
             xs_cls, xs_reg = self._rpn_forward(batch_x)
             xs_reg = [self.tanh(x_reg) for x_reg in xs_reg]
-            xs_reg = [x_reg.mul(size[0]).div(2) for x_reg in xs_reg]
+            # xs_reg = [x_reg.mul(size[0]).div(2) for x_reg in xs_reg]
+            xs_reg = [self._proportion_box(x_reg, img_size) for x_reg in xs_reg]
             # print(f"-- Batch total time: {(time.time() - start):.2f}")
             xs_cls = tuple(xs_cls) #* Make them tuples to distinguish batces from non batches
             xs_reg = tuple(xs_reg)
         return xs_cls, xs_reg
+    
+    @staticmethod
+    def _proportion_box(x_reg, img_size, batched=True):
+        # start = time.time()
+        img_h, img_w = img_size
+        if batched:
+            N, Cx4, H, W = x_reg.shape
+            C = Cx4//4
+            view = N, C, 4, H, W
+            permutation = 2,0,1,3,4
+            og_view = N, Cx4, H, W
+            og_permutation = 1,2,0,3,4
+        else:
+            Cx4, H, W = x_reg.shape
+            C = Cx4//4
+            view = C, 4, H, W
+            permutation = 1,0,2,3
+            og_view = Cx4, H, W
+            og_permutation = permutation
+        x_reg = x_reg.view(view)
+        x_reg = x_reg.permute(permutation)
+
+        h_mask = torch.zeros_like(x_reg).to(torch.bool)
+        h_mask[0] = True
+        h_mask[2] = True
+        w_mask = torch.zeros_like(x_reg).to(torch.bool)
+        w_mask[1] = True
+        w_mask[3] = True
+
+        x_reg.mul_(torch.where(h_mask, img_h, x_reg)).div_(torch.where(h_mask, H, x_reg))
+        x_reg.mul_(torch.where(w_mask, img_w, x_reg)).div_(torch.where(w_mask, W, x_reg))
+            
+        x_reg = x_reg.permute(og_permutation).view(og_view)
+        # print(f"Proportion time: {(time.time() - start):.2f}")
+        return x_reg
 
 class RPNLoss(nn.Module):
     def __init__(self, reg_norm=10): #TODO: no hardcode n_cls, n_reg in init
